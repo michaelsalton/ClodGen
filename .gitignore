@@ -1,0 +1,33 @@
+# Build output
+build/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Executables
+clodgen
+
+# Debug / profiling
+*.dSYM/
+*.gcda
+*.gcno
+*.gcov
+perf.data*
+callgrind.out.*
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+compile_commands.json
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
