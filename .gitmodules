@@ -2,3 +2,7 @@
 	path = external/SimLOD
 	url = git@github.com:m-schuetz/SimLOD.git
 	branch = main
+[submodule "external/CudaLOD"]
+	path = external/CudaLOD
+	url = git@github.com:m-schuetz/CudaLOD.git
+	branch = main

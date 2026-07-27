@@ -27,6 +27,7 @@ compiled by this Makefile — it only globs `src/*.cpp`.
 | Path                 | Upstream                                  | Notes                            |
 | -------------------- | ----------------------------------------- | -------------------------------- |
 | `external/SimLOD`    | https://github.com/m-schuetz/SimLOD       | CUDA point-cloud LOD renderer    |
+| `external/CudaLOD`   | https://github.com/m-schuetz/CudaLOD      | Earlier CUDA LOD work + paper    |
 
 Clone with submodules:
 
