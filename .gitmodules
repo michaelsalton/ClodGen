@@ -1,0 +1,4 @@
+[submodule "external/SimLOD"]
+	path = external/SimLOD
+	url = git@github.com:m-schuetz/SimLOD.git
+	branch = main
