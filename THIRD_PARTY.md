@@ -106,10 +106,3 @@ A negative entry is as valuable as a positive one; this is why it is recorded.
 | `CudaLOD/modules/simlod/sampling_cuda/**`, `voxel_sampling_gentree/**` | earlier generations, not instantiated upstream |
 | `CudaLOD/libs/openvr/**` | Windows-only binary; VR is off by default and the code paths never execute |
 | ~9 dead `voxelize_*.cu` variants, `split_countsort`, `split_hashmap` | superseded precursors; upstream marks one "prototyping, dont use" |
-
-## Note on `Papers/`
-
-`Papers/SimLOD.pdf` is checked in. Publisher PDFs are frequently not
-redistributable. Before this repository is made public, confirm it is the
-authors' accepted/preprint version, or replace it with a `Papers/README.md`
-listing DOIs and arXiv links.
