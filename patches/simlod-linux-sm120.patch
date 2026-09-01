@@ -1,0 +1,78 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 12a12b1..be93896 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -47,7 +47,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
+ 
+ target_link_libraries(${PROJECT_NAME}
+ 	CUDA::cuda_driver
+-	CUDA::nvrtc)
++	CUDA::nvrtc
++	CUDA::nvJitLink)
+ 
+ ## OpenGL
+ find_package(OpenGL REQUIRED)
+diff --git a/include/CudaModularProgram.h b/include/CudaModularProgram.h
+index d594a96..a8bad78 100644
+--- a/include/CudaModularProgram.h
++++ b/include/CudaModularProgram.h
+@@ -79,12 +79,23 @@ struct CudaModule{
+ 		// 	println("{} does not exists", path);
+ 		// }
+ 
+-		string cuda_path = std::getenv("CUDA_PATH");
++		// CUDA_PATH is not conventionally set on Linux; fall back to the
++		// default toolkit location instead of constructing a string from null.
++		const char* cuda_path_env = std::getenv("CUDA_PATH");
++		string cuda_path = cuda_path_env ? cuda_path_env : "/usr/local/cuda";
+ 		// string cuda_include = "-I " + cuda_path + "/include";
+ 
++		// Target arch is overridable; default matches Blackwell (sm_120).
++		const char* arch_env = std::getenv("SIMLOD_GPU_ARCH");
++		string arch_opt = std::format("--gpu-architecture={}",
++			arch_env ? arch_env : "compute_120");
++
+ 		string optInclude = std::format("-I {}", dir).c_str();
+ 		string cuda_include = std::format("-I {}/include", cuda_path);
+-		// string cudastd_include = std::format("-I {}/include/cuda/std", cuda_path);
++		// CUDA 13 moved the CCCL/libcu++ headers (<cuda/std/*>, pulled in by
++		// cooperative_groups) into include/cccl. Harmless on CUDA 12, where
++		// they sit directly under include/.
++		string cccl_include = std::format("-I {}/include/cccl", cuda_path);
+ 
+ 		println("cuda_include: '{}'", optInclude);
+ 
+@@ -96,13 +107,14 @@ struct CudaModule{
+ 		// println("{}", source);
+ 
+ 		nvrtcCreateProgram(&prog, source.c_str(), name.c_str(), 0, NULL, NULL);
+-		std::vector<const char*> opts = { 
+-			"--gpu-architecture=compute_89",
++		std::vector<const char*> opts = {
++			arch_opt.c_str(),
+ 			// "--gpu-architecture=compute_86",
+ 			"--use_fast_math",
+ 			"--extra-device-vectorization",
+ 			"-lineinfo",
+ 			cuda_include.c_str(),
++			cccl_include.c_str(),
+ 			optInclude.c_str(),
+ 			"-I ./",
+ 			"--relocatable-device-code=true",
+diff --git a/modules/progressive_octree/main_progressive_octree.cpp b/modules/progressive_octree/main_progressive_octree.cpp
+index bd020c2..3af65e3 100644
+--- a/modules/progressive_octree/main_progressive_octree.cpp
++++ b/modules/progressive_octree/main_progressive_octree.cpp
+@@ -267,7 +267,12 @@ uint64_t frameCounter = 0;
+ void initCuda(){
+ 	cuInit(0);
+ 	cuDeviceGet(&device, 0);
++	// CUDA 13 bumped cuCtxCreate to _v4, which takes a CUctxCreateParams*.
++#if CUDA_VERSION >= 13000
++	cuCtxCreate(&context, nullptr, 0, device);
++#else
+ 	cuCtxCreate(&context, 0, device);
++#endif
+ 	cuStreamCreate(&stream_upload, CU_STREAM_NON_BLOCKING);
+ 	cuStreamCreate(&stream_download, CU_STREAM_NON_BLOCKING);
+ 

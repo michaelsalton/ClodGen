@@ -1,0 +1,9 @@
+# Programs this pipeline compiles and links, one per line.
+#
+# Each line is one CudaModularProgram: a set of modules linked together. Blank lines and
+# # comments are ignored. Paths are relative to this directory.
+#
+# `clodgen --check-kernels` reads these files so it links modules the way the pipeline
+# actually does. That matters because not every .cu is a standalone translation unit --
+# see kernels/cudalod/programs.txt for the case that forced this.
+flat_render.cu

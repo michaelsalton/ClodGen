@@ -1,5 +1,12 @@
+# Point cloud test data - large binaries, not source
+data/
+*.las
+*.laz
+*.simlod
+
 # Build output
 build/
+build-debug/
 *.o
 *.obj
 *.a
@@ -27,6 +34,12 @@ callgrind.out.*
 *~
 compile_commands.json
 .cache/
+
+# Runtime output
+# ImGui writes window layout next to the working directory on exit.
+imgui.ini
+# --dump-frame output
+*.ppm
 
 # OS
 .DS_Store
