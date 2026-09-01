@@ -89,6 +89,22 @@ void App::drawGui() {
 	}
 
 	ImGui::Text("%.1f fps  (%.2f ms)", m_renderer.fps(), m_renderer.frameMs());
+
+	// Exit on the same row, right-aligned. Escape already closes the window, but a
+	// keyboard-only shutdown is undiscoverable, and the loop is caller-owned
+	// (GLRenderer.h) precisely so there IS a clean shutdown path -- so expose it.
+	{
+		constexpr float kExitWidth = 56.0f;
+		ImGui::SameLine(ImGui::GetWindowContentRegionWidth() - kExitWidth);
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.13f, 0.11f, 1.0f));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.65f, 0.18f, 0.15f, 1.0f));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.80f, 0.22f, 0.18f, 1.0f));
+		const bool exitClicked = ImGui::Button("Exit", ImVec2(kExitWidth, 0.0f));
+		ImGui::PopStyleColor(3);
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("quit ClodGen (or press Escape)");
+		if (exitClicked) m_renderer.requestClose();
+	}
+
 	if (pipeline) {
 		ImGui::Text("render kernel: %.2f ms", pipeline->renderDeviceMsLast);
 	}
