@@ -97,17 +97,41 @@ With those, the run is clean: **0** illegal-access errors across all four builds
 The port is deterministic (identical across runs), and the device code is vendored
 unmodified, so the tree really is the same tree.
 
-**The voxel delta is an input-provenance difference, not a port defect.** The reference
-reads the `.las`, whose header carries an f64 extent of `1399.9900000002235`; ClodGen
-currently reads the `.simlod`, whose header is f32 (`1399.989990234375`). CudaLOD derives
-`cubeSize` from the longest axis of that box, so a last-bit difference shifts the 128³
-voxel grid's cell boundaries and a few hundred points fall in different cells. Confirming
-this requires the `.las` reader, so that the identical file can be loaded — until then it
-is an explanation, not a closed issue.
+### The voxel delta is NOT bounding-box provenance — that was tested and refuted
 
-Worth remembering as a general lesson for this project: bounding-box provenance is part of
-the input. Two readers of the same points can produce trees that differ slightly, which is
-exactly why `CloudMeta` keeps the translation in f64 and snaps it to a power of two.
+This entry used to explain the +388 as an f32-vs-f64 bounding-box difference: the
+reference reads the `.las`, whose header carries an f64 extent of `1399.9900000002235`,
+while ClodGen read the `.simlod`, whose header is f32 (`1399.989990234375`); CudaLOD
+derives `cubeSize` from the longest axis, so a last-bit difference would shift the 128³
+grid's cell boundaries. It was recorded as needing the `.las` reader to confirm.
+
+The reader landed. It does not confirm it:
+
+| input | voxels | nodes | max points/node |
+| ----- | ------ | ----- | --------------- |
+| `morro_bay_36M.simlod` | 12,742,500 | 2,252 | 49,739 |
+| `morro_bay_36M.las` | 12,742,500 | 2,252 | 49,739 |
+| `morro_bay_36M.laz` | 12,742,500 | 2,252 | 49,739 |
+
+All three are bit-identical, and the `--dump-frame` PPMs are byte-identical, at 36M and at
+350M points. Reading the very file the reference read changes nothing, so the box cannot be
+what differs.
+
+The mechanism is now clear, and it is upstream's own: `Metadata::max_x` is a **`float`** in
+`kernels/cudalod/common.h` (vendored unmodified, so the reference has the same field).
+`1399.9900000002235` and `1399.989990234375` narrow to the *same* f32 before any kernel
+sees either one. The f64 header extent never reaches the grid.
+
+So the +388 (0.003%) is still open, and the remaining candidates are all downstream of the
+box: `FIRST_COME` sampling resolving ties differently under a different thread schedule,
+and the same unchecked capacities in `split_countsort_blockwise` that
+`makeSyntheticSource` documents. Whatever it is, it is not the input.
+
+The general lesson survives, just not the specific claim: bounding-box provenance *is* part
+of the input, which is why `CloudMeta` keeps the box and the translation in f64. The
+correction is that keeping f64 on the host buys nothing once the value crosses into an f32
+device struct — check the width of the field the number actually lands in before attributing
+a difference to precision.
 
 ## SimLOD
 

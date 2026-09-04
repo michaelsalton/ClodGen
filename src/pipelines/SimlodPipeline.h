@@ -66,7 +66,8 @@ public:
 	void render(const FrameContext& frame) override;
 
 	const PipelineStats& stats() const override { return m_stats; }
-	void gui() override;
+	TimingScopes timingScopes() const override;
+	void gui(const GpuProfiler& profiler) override;
 
 private:
 	void readStats();
@@ -107,9 +108,6 @@ private:
 	uint64_t m_scratchBytes = 0;
 	CUdeviceptr m_diagnostics = 0;
 
-	CUevent m_buildStart = nullptr;
-	CUevent m_buildEnd = nullptr;
-
 	bool m_needsReset = true;
 	bool m_complete = false;
 	uint64_t m_numPoints = 0;
@@ -117,7 +115,6 @@ private:
 	PipelineStats m_stats;
 	int m_blockSize = 256;
 
-	double m_lastBuildMs = 0.0;
 	uint32_t m_batchesConsumed = 0;
 	uint32_t m_batchesTotal = 0;
 };

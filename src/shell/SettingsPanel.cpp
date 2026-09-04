@@ -16,8 +16,10 @@
 
 #include <cinttypes>
 
+#include "clod/GpuProfiler.h"
 #include "clod/unsuck.hpp"
 #include "shell/App.h"
+#include "shell/TimingUi.h"
 
 namespace clod {
 
@@ -88,7 +90,12 @@ void App::drawGui() {
 		ImGui::Separator();
 	}
 
-	ImGui::Text("%.1f fps  (%.2f ms)", m_renderer.fps(), m_renderer.frameMs());
+	// Mean fps with the tail beside it. A mean alone is the wrong summary for a
+	// progressive builder: the whole point of the construction budget is that it bounds
+	// the hitch, and a hitch is invisible in an average.
+	ImGui::Text("%.1f fps  (%.2f ms, med %.2f, p95 %.2f)", m_renderer.fps(),
+	            m_renderer.frameMs(), m_frameTimeStats.median(),
+	            m_frameTimeStats.percentile(0.95));
 
 	// Exit on the same row, right-aligned. Escape already closes the window, but a
 	// keyboard-only shutdown is undiscoverable, and the loop is caller-owned
@@ -106,7 +113,20 @@ void App::drawGui() {
 	}
 
 	if (pipeline) {
-		ImGui::Text("render kernel: %.2f ms", pipeline->renderDeviceMsLast);
+		const TimingScopes scopes = pipeline->timingScopes();
+		if (ImGui::BeginTable("frame_timing", 2, ImGuiTableFlags_SizingStretchProp)) {
+			timingRow(m_profiler, "render kernel (ms)", scopes.render);
+			ImGui::EndTable();
+		}
+		ImGui::TextDisabled("timing regime: %s%s", regimeName(m_profiler.regime()),
+		                    m_profiler.regime() == Regime::Strict
+		                        ? ""
+		                        : "  (--strict-timing for per-frame attribution)");
+		if (m_profiler.droppedScopes() > 0) {
+			ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "%llu timing sample(s) dropped",
+			                   static_cast<unsigned long long>(
+			                       m_profiler.droppedScopes()));
+		}
 	}
 
 	// --- dataset ------------------------------------------------------------
@@ -250,6 +270,32 @@ void App::drawGui() {
 	ImGui::Combo("colour", &m_settings.colorMode, colorModes,
 	             IM_ARRAYSIZE(colorModes));
 
+	// --- octree wireframe --------------------------------------------------
+	ImGui::Checkbox("node boxes", &m_settings.showBoundingBox);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip(
+			"Draw a cube per node the selection pass emitted, coloured by\n"
+			"level -- the same colours 'by LOD' gives the samples, so a box\n"
+			"and its contents match.\n"
+			"\n"
+			"This is the LOD cut itself rather than an inference from it:\n"
+			"SimLOD emits a disjoint frontier, so its boxes tile; CudaLOD\n"
+			"marks parents and children both visible, so its boxes nest.\n"
+			"`flat` has no tree and draws none.");
+	}
+
+	ImGui::SameLine();
+	ImGui::Checkbox("points", &m_settings.showPoints);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip(
+			"Off leaves the wireframe on its own, which is the only way to\n"
+			"read it in a dense cloud.\n"
+			"\n"
+			"A view toggle only: selection still runs, so the visible-sample\n"
+			"counts below continue to report what the pipeline CHOSE and a\n"
+			"hidden frame is not mistaken for a cheap one.");
+	}
+
 	// --- cloud -------------------------------------------------------------
 	sectionHeader("Cloud");
 	if (ImGui::BeginTable("cloud", 2, ImGuiTableFlags_SizingStretchProp)) {
@@ -317,7 +363,7 @@ void App::drawGui() {
 		}
 
 		sectionHeader(("Pipeline: " + m_registry.activeId()).c_str());
-		pipeline->gui();
+		pipeline->gui(m_profiler);
 	} else {
 		ImGui::TextColored(ImVec4(1, 0.35f, 0.25f, 1), "no active pipeline");
 	}

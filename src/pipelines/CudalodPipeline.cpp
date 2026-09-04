@@ -9,7 +9,9 @@
 
 #include "clod/CudaCheck.h"
 #include "clod/CudaContext.h"
+#include "clod/GpuProfiler.h"
 #include "clod/PointSource.h"
+#include "shell/TimingUi.h"
 
 // The pipeline's own host/device contract, vendored unmodified. Deliberately NOT merged
 // into clod/HostDeviceCommon.h: rewriting the struct the reference kernels read is how a
@@ -47,12 +49,6 @@ const char* strategyName(int s) {
 		case WEIGHTED_NEIGHBORHOOD: return "3  WEIGHTED_NEIGHBORHOOD";
 		default: return "?";
 	}
-}
-
-float eventMs(CUevent start, CUevent end) {
-	float ms = 0.0f;
-	if (cuEventElapsedTime(&ms, start, end) != CUDA_SUCCESS) return 0.0f;
-	return ms;
 }
 
 }  // namespace
@@ -165,11 +161,6 @@ bool CudalodPipeline::allocate(const CloudMeta& meta, const DeviceBudget& budget
 		return false;
 	}
 
-	CLOD_CU(cuEventCreate(&m_splitStart, CU_EVENT_DEFAULT));
-	CLOD_CU(cuEventCreate(&m_splitEnd, CU_EVENT_DEFAULT));
-	CLOD_CU(cuEventCreate(&m_voxelStart, CU_EVENT_DEFAULT));
-	CLOD_CU(cuEventCreate(&m_voxelEnd, CU_EVENT_DEFAULT));
-
 	m_stats.numPoints = meta.numPoints;
 	m_stats.bytesAllocated = m_slabBytes;
 	return true;
@@ -187,13 +178,6 @@ void CudalodPipeline::release() {
 	m_slabBytes = 0;
 	m_scratchBytes = 0;
 
-	for (CUevent* e : {&m_splitStart, &m_splitEnd, &m_voxelStart, &m_voxelEnd}) {
-		if (*e) {
-			cuEventDestroy(*e);
-			*e = nullptr;
-		}
-	}
-
 	m_inputPoints = 0;
 	m_numPoints = 0;
 	m_built = false;
@@ -206,9 +190,18 @@ void CudalodPipeline::reset() {
 	if (m_nodes) CLOD_CU(cuMemsetD8(m_nodes, 0, 8));
 	if (m_allocOffset) CLOD_CU(cuMemsetD8(m_allocOffset, 0, 8));
 	if (m_diagnostics) CLOD_CU(cuMemsetD8(m_diagnostics, 0, sizeof(DeviceDiagnostics)));
-	buildDeviceMsTotal = 0.0;
-	buildLaunchCount = 0;
-	m_splitMs = m_voxelizeMs = 0.0;
+	m_clearTimingRequested = true;
+}
+
+TimingScopes CudalodPipeline::timingScopes() const {
+	TimingScopes scopes;
+	// Kept as two scopes, not one total, because the paper reports them separately and
+	// because they scale very differently across strategies: split is flat at ~5 ms
+	// while voxelize spans 4 ms to 61 ms. A single "build" number would hide the only
+	// thing the strategy choice actually changes.
+	scopes.build = {"cudalod.split", "cudalod.voxelize"};
+	scopes.render = "cudalod.render";
+	return scopes;
 }
 
 bool CudalodPipeline::build(PointSource& source, const FrameContext& frame) {
@@ -220,6 +213,14 @@ bool CudalodPipeline::build(PointSource& source, const FrameContext& frame) {
 
 	if (m_built && !m_rebuildRequested) return false;
 	m_rebuildRequested = false;
+
+	// Repeated rebuilds at a FIXED strategy accumulate into one distribution on purpose
+	// -- press rebuild ten times and the median is worth more than any single run. Only
+	// a change that makes the samples describe different work clears them.
+	if (m_clearTimingRequested) {
+		m_clearTimingRequested = false;
+		if (frame.profiler) frame.profiler->clearPrefix("cudalod.");
+	}
 
 	m_inputPoints = source.residentPoints();
 	m_numPoints = source.meta().numPoints;
@@ -260,11 +261,12 @@ bool CudalodPipeline::build(PointSource& source, const FrameContext& frame) {
 
 	// Phase 1: split. Grid from occupancy.
 	const int gridSplit = m_cuda.gridForKernel(kernel2, m_blockSize);
-	CLOD_CU(cuEventRecord(m_splitStart, 0));
-	CLOD_CU(cuLaunchCooperativeKernel(kernel2, static_cast<unsigned>(gridSplit), 1, 1,
-	                                  static_cast<unsigned>(m_blockSize), 1, 1, 0, 0,
-	                                  args));
-	CLOD_CU(cuEventRecord(m_splitEnd, 0));
+	{
+		GpuScope scope(frame.profiler, "cudalod.split");
+		CLOD_CU(cuLaunchCooperativeKernel(kernel2, static_cast<unsigned>(gridSplit), 1, 1,
+		                                  static_cast<unsigned>(m_blockSize), 1, 1, 0, 0,
+		                                  args));
+	}
 
 	// Check for a dead context after EACH phase, not just at the end.
 	//
@@ -286,11 +288,12 @@ bool CudalodPipeline::build(PointSource& source, const FrameContext& frame) {
 	// per-block sampling grid from the slab, so more blocks would overrun it. This is
 	// upstream's constraint and it is load-bearing.
 	const int gridVoxelize = m_cuda.gridForKernel(kernel3, m_blockSize, 1);
-	CLOD_CU(cuEventRecord(m_voxelStart, 0));
-	CLOD_CU(cuLaunchCooperativeKernel(kernel3, static_cast<unsigned>(gridVoxelize), 1,
-	                                  1, static_cast<unsigned>(m_blockSize), 1, 1, 0,
-	                                  0, args));
-	CLOD_CU(cuEventRecord(m_voxelEnd, 0));
+	{
+		GpuScope scope(frame.profiler, "cudalod.voxelize");
+		CLOD_CU(cuLaunchCooperativeKernel(kernel3, static_cast<unsigned>(gridVoxelize), 1,
+		                                  1, static_cast<unsigned>(m_blockSize), 1, 1, 0,
+		                                  0, args));
+	}
 
 	// Synchronise and check for a dead context BEFORE touching any result. A device
 	// fault here poisons everything downstream, so this is the only place it can be
@@ -303,11 +306,6 @@ bool CudalodPipeline::build(PointSource& source, const FrameContext& frame) {
 		}
 		CLOD_CU(sync);
 	}
-
-	m_splitMs = eventMs(m_splitStart, m_splitEnd);
-	m_voxelizeMs = eventMs(m_voxelStart, m_voxelEnd);
-	buildDeviceMsTotal = m_splitMs + m_voxelizeMs;
-	buildLaunchCount += 2;
 
 	readResults();
 
@@ -387,9 +385,14 @@ void CudalodPipeline::render(const FrameContext& frame) {
 	void* kernelArgs[] = {&args, &nodes, &numNodes, &diag};
 
 	const int grid = m_cuda.gridForKernel(kernel, m_blockSize);
-	CLOD_CU(cuLaunchCooperativeKernel(kernel, static_cast<unsigned>(grid), 1, 1,
-	                                  static_cast<unsigned>(m_blockSize), 1, 1, 0, 0,
-	                                  kernelArgs));
+	{
+		// As with SimLOD, this launch previously had no events on either side, so
+		// CudaLOD's render time was never measured at all.
+		GpuScope scope(frame.profiler, "cudalod.render");
+		CLOD_CU(cuLaunchCooperativeKernel(kernel, static_cast<unsigned>(grid), 1, 1,
+		                                  static_cast<unsigned>(m_blockSize), 1, 1, 0, 0,
+		                                  kernelArgs));
+	}
 
 	if (frame.strictTiming) {
 		const CUresult sync = cuCtxSynchronize();
@@ -408,7 +411,7 @@ void CudalodPipeline::render(const FrameContext& frame) {
 	}
 }
 
-void CudalodPipeline::gui() {
+void CudalodPipeline::gui(const GpuProfiler& profiler) {
 	ImGui::TextUnformatted(
 		"Batch construction: the whole cloud is resident, then\n"
 		"split (kernel2) and voxelise (kernel3) build the tree in one shot.");
@@ -425,8 +428,10 @@ void CudalodPipeline::gui() {
 	if (m_strategy != previous) {
 		// Changing strategy rebuilds the whole tree. Worth knowing that it is not free
 		// and not equivalent: WEIGHTED_NEIGHBORHOOD voxelises ~13x slower than
-		// FIRST_COME for bit-identical tree structure.
+		// FIRST_COME for bit-identical tree structure. That is also why the timing
+		// samples are dropped -- a median pooled across two strategies describes neither.
 		m_rebuildRequested = true;
+		m_clearTimingRequested = true;
 	}
 
 	ImGui::Separator();
@@ -438,14 +443,22 @@ void CudalodPipeline::gui() {
 			ImGui::TableNextColumn();
 			ImGui::Text(fmt, v);
 		};
-		row("split", "%.2f ms", m_splitMs);
-		row("voxelize", "%.2f ms", m_voxelizeMs);
-		row("total", "%.2f ms", m_splitMs + m_voxelizeMs);
-		const double mps = (m_splitMs + m_voxelizeMs) > 0.0
-		                       ? double(m_numPoints) / 1e6 /
-		                             ((m_splitMs + m_voxelizeMs) / 1000.0)
-		                       : 0.0;
-		row("throughput", "%.0f MP/s", mps);
+		timingRow(profiler, "split (ms)", "cudalod.split");
+		timingRow(profiler, "voxelize (ms)", "cudalod.voxelize");
+		timingRow(profiler, "render (ms)", "cudalod.render");
+
+		// Throughput derives from the MEDIAN of one build, not the sum over rebuilds:
+		// the cloud is voxelised once per build, so summing ten rebuilds would divide
+		// 36M points by ten builds' worth of time. SimLOD's row is the opposite case and
+		// correctly uses the total, since there the launches partition one ingest.
+		const ScopeStats* split = profiler.find("cudalod.split");
+		const ScopeStats* voxelize = profiler.find("cudalod.voxelize");
+		const double buildMedian = (split ? split->median() : 0.0) +
+		                           (voxelize ? voxelize->median() : 0.0);
+		row("build (median split+voxelize)", "%.2f ms", buildMedian);
+		const double mps =
+			buildMedian > 0.0 ? double(m_numPoints) / 1e6 / (buildMedian / 1000.0) : 0.0;
+		row("throughput (median build)", "%.0f MP/s", mps);
 		row("slab", "%.2f GB", double(m_slabBytes) / 1e9);
 		row("watermark split", "%.2f GB", double(m_allocatedSplitting) / 1e9);
 		row("watermark voxelize", "%.2f GB", double(m_allocatedVoxelization) / 1e9);

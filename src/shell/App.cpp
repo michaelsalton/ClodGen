@@ -10,6 +10,7 @@
 
 #include "clod/CudaCheck.h"
 #include "clod/unsuck.hpp"
+#include "io/LasReader.h"
 #include "pipelines/CudalodPipeline.h"
 #include "pipelines/FlatPipeline.h"
 #include "pipelines/SimlodPipeline.h"
@@ -39,6 +40,11 @@ App::~App() = default;
 
 bool App::init(const AppOptions& options, std::string* err) {
 	m_options = options;
+
+	// Seed the shared settings the panel then owns, so --show-bounds and --hide-points
+	// give a scripted run the same view a click would.
+	m_settings.showBoundingBox = options.showBoundingBox;
+	m_settings.showPoints = !options.hidePoints;
 
 	if (!m_renderer.init("ClodGen", options.width, options.height, err)) {
 		return false;
@@ -172,6 +178,13 @@ bool App::loadCloud(const std::vector<std::string>& files, std::string* err) {
 bool App::activateCloud(std::string* err) {
 	m_budget = computeBudget();
 
+	// A new scene makes every retained sample non-comparable. Note this is NOT done on a
+	// pipeline switch: there the cloud is unchanged, so keeping flat.render alongside
+	// simlod.render is the whole point -- the control condition and the thing being
+	// measured, on the same camera and the same pixel budget.
+	m_profiler.clear();
+	m_frameTimeStats.clear();
+
 	if (!m_source->start(PointSource::Mode::Whole, m_budget.bytes, err)) {
 		return false;
 	}
@@ -266,8 +279,19 @@ std::vector<DatasetEntry> scanDatasetDir(const std::string& dir) {
 			// against the reference without reading the file.
 			if (entry.bytes > 24) entry.numPoints = (entry.bytes - 24) / 16;
 		} else {
-			entry.supported = false;
-			entry.note = ext.substr(1) + " reading is not implemented yet";
+			// LAS/LAZ carry an exact count in the header, so read it -- 375 bytes per
+			// file, and it makes the dropdown's counts authoritative rather than
+			// inferred. A header that will not parse is the same thing as a file that
+			// will not load, so report it here instead of at load time.
+			LasHeaderInfo info;
+			std::string headerErr;
+			if (readLasHeader(entry.path, info, &headerErr)) {
+				entry.supported = true;
+				entry.numPoints = info.numPoints;
+			} else {
+				entry.supported = false;
+				entry.note = headerErr;
+			}
 		}
 
 		out.push_back(std::move(entry));
@@ -401,6 +425,14 @@ int App::run() {
 	};
 
 	auto render = [this] {
+		// One regime for the whole process, since --strict-timing is a startup option.
+		// Kept per-frame anyway so the profiler files samples under the regime that
+		// produced them rather than trusting the caller to be consistent.
+		const Regime regime =
+			m_options.strictTiming ? Regime::Strict : Regime::Deferred;
+		m_profiler.beginFrame(m_frameCounter, regime, nullptr);
+		m_frameTimeStats.add(m_renderer.frameMs());
+
 		SharedUniforms uniforms = buildUniforms();
 
 		// Freeze the LOD-selection transform when asked, so the cut can be locked
@@ -430,6 +462,7 @@ int App::run() {
 				frame.stream = nullptr;
 				frame.numSMs = m_cuda->numSMs();
 				frame.strictTiming = m_options.strictTiming;
+				frame.profiler = &m_profiler;
 
 				// Render BEFORE build, matching upstream's ordering: both are on the
 				// null stream so they serialise anyway, and this way a frame shows
@@ -444,6 +477,10 @@ int App::run() {
 				m_statusIsError = true;
 			}
 		}
+
+		// Closed BEFORE the GUI, so that in the strict regime this frame's own samples
+		// are the ones the panel shows rather than the previous frame's.
+		m_profiler.endFrame();
 
 		drawGui();
 		++m_frameCounter;
@@ -544,12 +581,59 @@ bool App::dumpFrame(const std::string& path) {
 		       formatNumber(static_cast<double>(s.numVisibleNodes)).c_str());
 		printf("  max points/node     %s\n",
 		       formatNumber(static_cast<double>(s.maxPointsPerNode)).c_str());
-		printf("  build device ms     %.2f (%u launches)\n",
-		       pipeline->buildDeviceMsTotal, pipeline->buildLaunchCount);
-		printf("  render device ms    %.2f\n", pipeline->renderDeviceMsLast);
+
+		const TimingScopes scopes = pipeline->timingScopes();
+		const BuildTotals build = buildTotals(m_profiler, scopes);
+		if (build.measured) {
+			printf("  build device ms     %.2f (%llu launches)\n", build.ms,
+			       static_cast<unsigned long long>(build.launches));
+		} else {
+			printf("  build device ms     not measured\n");
+		}
+
+		// Printed as "not measured" rather than 0.00 when no sample exists. The
+		// distinction matters: in the deferred regime a render scope may legitimately
+		// have nothing harvested yet, and the previous code's 0.00 was indistinguishable
+		// from a kernel that genuinely cost nothing.
+		const ScopeStats* render =
+			scopes.render.empty() ? nullptr : m_profiler.find(scopes.render);
+		if (render) {
+			printf("  render device ms    %.2f  (median %.2f, p95 %.2f, n=%llu, %s)\n",
+			       render->last(), render->median(), render->percentile(0.95),
+			       static_cast<unsigned long long>(render->count()),
+			       regimeName(m_profiler.regime()));
+		} else {
+			printf("  render device ms    not measured (%s regime)\n",
+			       regimeName(m_profiler.regime()));
+		}
+
+		printf("  frame wall ms       %.2f  (median %.2f, p95 %.2f, n=%llu)\n",
+		       m_frameTimeStats.last(), m_frameTimeStats.median(),
+		       m_frameTimeStats.percentile(0.95),
+		       static_cast<unsigned long long>(m_frameTimeStats.count()));
+
 		printf("  device high water   %.3f GB of %.3f GB\n",
 		       static_cast<double>(s.bytesHighWater) / 1e9,
 		       static_cast<double>(s.bytesAllocated) / 1e9);
+		if (m_profiler.droppedScopes() > 0) {
+			printf("  WARNING %llu profiler sample(s) dropped\n",
+			       static_cast<unsigned long long>(m_profiler.droppedScopes()));
+		}
+
+		// Every scope, not just the two aggregates. This is what a scripted run asserts
+		// against -- bench/reference/README.md's per-strategy split and voxelize medians
+		// are a table of exactly these numbers, so they double as an oracle for the
+		// instrument itself.
+		printf("  scopes (%s regime)\n", regimeName(m_profiler.regime()));
+		for (const std::string& name : m_profiler.scopeNames()) {
+			const ScopeStats* st = m_profiler.find(name);
+			if (!st) continue;
+			printf("    %-20s n=%-6llu last %7.3f  med %7.3f  p95 %7.3f  "
+			       "min %7.3f  max %7.3f  total %9.2f\n",
+			       name.c_str(), static_cast<unsigned long long>(st->count()),
+			       st->last(), st->median(), st->percentile(0.95), st->min(), st->max(),
+			       st->total());
+		}
 		// Health flags invalidate a run: the structure was silently truncated.
 		if (s.allocOverflow) printf("  WARNING allocator overflow\n");
 		if (s.nodeCapacityReached) printf("  WARNING node pool exhausted\n");

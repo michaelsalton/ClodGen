@@ -200,6 +200,12 @@ extern "C" __global__ void kernel_render(RenderArgs args, void** nnodes,
 	clod::clodApplyEDL(framebuffer, u);
 	grid.sync();
 
+	// After EDL, deliberately -- see the note on clodDrawListWireframe. Unlike SimLOD's
+	// disjoint frontier, CudaLOD marks a parent AND its children visible, so expect
+	// nested cubes here. That is the selection difference made visible, not a bug.
+	clod::clodDrawListWireframe(drawList, framebuffer, u);
+	grid.sync();
+
 	clod::clodResolve(framebuffer, u,
 	                  static_cast<cudaSurfaceObject_t>(args.surface));
 

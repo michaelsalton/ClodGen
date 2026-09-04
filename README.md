@@ -113,28 +113,60 @@ Working:
   (batch: counting-sort split + voxelisation, four sampling strategies), `simlod`
   (progressive octree). All three go through the same `DrawList` seam and the same
   rasteriser.
-- `.simlod` loading — 36,200,706 points from `morro_bay_36M.simlod` verified exactly.
+- **Loading, all three formats.** `.simlod`, `.las` (eight loader threads, ~110–140 MP/s)
+  and `.laz` (laszip, ~5 MP/s and sequential — see `src/io/LazReader.cpp`). The same cloud
+  read through all three produces bit-identical trees (2,252 nodes, 12,742,500 voxels on
+  `morro_bay_36M`) and byte-identical `--dump-frame` output at both 36M and 350M points,
+  which is what says the parsers agree rather than merely all running. LAS/LAZ apply the
+  translation in f64 inside the parse, so a UTM cloud keeps sub-millimetre resolution
+  instead of the ~4 cm an f32 coordinate has at that magnitude.
 - CUDA software rasteriser: packed `uint64` `atomicMin` framebuffer, EDL,
   `surf2Dwrite` into a GL texture registered once per resize.
 - Kernel hot reload: edit a `.cu` or `.cuh`, save, and the next frame runs it. A broken
   kernel is non-fatal and leaves the previous version live.
 - `--check-kernels` (headless compile+link of every declared program) and
   `--dump-frame` (headless frame capture) for verification without a human at a window.
+- **Octree wireframe.** `--show-bounds` (panel: *node boxes*) draws a cube per node the
+  selection pass emitted, coloured by level from the same hash colour-by-LOD gives the
+  samples; `--hide-points` leaves the structure on its own. It renders the cut rather
+  than inferring it from sample colours, and it makes the selection difference visible
+  directly: SimLOD's disjoint frontier tiles, CudaLOD's parent-and-child visibility
+  nests. Depth-tested through the shared framebuffer, so an edge behind a surface is
+  hidden by it, and drawn after EDL so the overlay is not lit by its own edges.
 - CudaLOD's port reproduces the upstream reference exactly on point, node and
   watermark counts — see [bench/reference/README.md](bench/reference/README.md).
+- **GPU timing**, shell-owned. Every kernel launch is bracketed by a `GpuScope`, and the
+  profiler keeps the distribution — median, p95, min/max, n — rather than a running sum.
+  Strict and deferred samples are filed separately and never pooled, and a scope nobody
+  measured reports as *not measured* instead of `0.00 ms`. `--dump-frame` prints the
+  per-scope table. This reproduces the CudaLOD reference numbers for strategy 0 within
+  ~2% (split 4.99 ms against 5.1, voxelize 4.08 against 4.1), which is the oracle that
+  says the instrument is right.
 
 Not there yet:
 
 - **The Analysis and Refinement kernels.** This is the actual project.
-- **No `.las` / `.laz` reader.** Only `.simlod` loads, so the reference's f32-vs-f64
-  bounding-box provenance question stays open, and datasets with strong complexity
-  contrast (Retz, Semantic3D) cannot be loaded at all.
+- **The +388-voxel gap against the CudaLOD reference is still unexplained.** The `.las`
+  reader was supposed to settle it, and it did settle what it is *not*: reading the very
+  file the reference read gives 12,742,500 voxels, exactly what the `.simlod` gives, so
+  the f32-vs-f64 bounding-box story recorded in
+  [bench/reference/README.md](bench/reference/README.md) cannot be the cause —
+  `Metadata::max_x` is a `float` in the vendored struct, which narrows both headers to the
+  same value before any kernel sees them.
+- **Parallel `.laz` decode.** laszip decodes sequentially here — ~70 s for the 350M cloud
+  against 3.2 s for the same points as `.las`. Fanning out needs the chunk table read up
+  front so a single-chunk file is not decoded N times over; laszip does not expose it and
+  lazperf does, which is the concrete reason to make the swap THIRD_PARTY.md already
+  contemplates.
 - **No quality metric harness.** `--dump-frame` writes a PPM; there is no Chamfer,
   Hausdorff or PCQM comparison against `flat`.
-- **Timing is incomplete.** Only `FlatPipeline` fills `renderDeviceMsLast`, so the GUI
-  prints a plausible-looking `0.00` for the other two. Staged in
-  [plans/02_ProfilingTools.md](plans/02_ProfilingTools.md), which is the prerequisite
-  for any claim about refinement cost.
+- **No benchmark harness.** Stage 1 of
+  [plans/02_ProfilingTools.md](plans/02_ProfilingTools.md) landed the instrument; there
+  is still no `--bench` writing an NDJSON time series over a deterministic camera orbit
+  (Stage 2), and no intra-kernel phase attribution — SimLOD's `expand` / `createVoxels`
+  / `insertPoints` marks are still computed on-device every launch and thrown away by a
+  no-op `CudaPrint` (Stage 3). CudaLOD's sampling strategy is also still GUI-only, so
+  only one row of the reference oracle can be checked from a script.
 - **The two LOD metrics are not yet interchangeable.** Both selection passes accept the
   shared pixel budget, but SimLOD's projects all eight corners and takes the screen
   AABB while CudaLOD's estimates from the node centre, so they do not interpret the

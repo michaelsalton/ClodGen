@@ -61,7 +61,8 @@ public:
 	void render(const FrameContext& frame) override;
 
 	const PipelineStats& stats() const override { return m_stats; }
-	void gui() override;
+	TimingScopes timingScopes() const override;
+	void gui(const GpuProfiler& profiler) override;
 
 private:
 	void readResults();
@@ -93,11 +94,15 @@ private:
 	CUdeviceptr m_inputPoints = 0;   // borrowed from PointSource; not owned
 	uint64_t m_numPoints = 0;
 
-	CUevent m_splitStart = nullptr, m_splitEnd = nullptr;
-	CUevent m_voxelStart = nullptr, m_voxelEnd = nullptr;
-
 	bool m_built = false;
 	bool m_rebuildRequested = false;
+
+	// Set when the previous samples stop describing the same work -- changing the
+	// sampling strategy, above all. WEIGHTED_NEIGHBORHOOD voxelises ~13x slower than
+	// FIRST_COME for a bit-identical tree, so pooling the two into one distribution
+	// produces a median that describes neither. Honoured in build(), which is where the
+	// profiler is in hand.
+	bool m_clearTimingRequested = false;
 
 	// Pipeline-owned tunable. Exposed in gui(); changing it rebuilds.
 	int m_strategy = 0;  // SamplingStrategy
@@ -105,10 +110,6 @@ private:
 	PipelineStats m_stats;
 	int m_blockSize = 256;
 
-	// Reported separately from buildDeviceMsTotal because the paper reports them
-	// separately, and because they scale very differently across strategies.
-	double m_splitMs = 0.0;
-	double m_voxelizeMs = 0.0;
 	uint64_t m_allocatedSplitting = 0;
 	uint64_t m_allocatedVoxelization = 0;
 };

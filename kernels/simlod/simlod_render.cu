@@ -245,6 +245,12 @@ extern "C" __global__ void kernel_render(RenderArgs args, Node* nodes, Stats* st
 	clod::clodApplyEDL(framebuffer, u);
 	grid.sync();
 
+	// After EDL, deliberately -- see the note on clodDrawListWireframe. Because
+	// SimLOD's frontier is disjoint, every cube drawn here is a leaf of the cut, so
+	// what you see is the partition itself with no parent boxes overlaying it.
+	clod::clodDrawListWireframe(drawList, framebuffer, u);
+	grid.sync();
+
 	clod::clodResolve(framebuffer, u,
 	                  static_cast<cudaSurfaceObject_t>(args.surface));
 

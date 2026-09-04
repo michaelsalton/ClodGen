@@ -4,8 +4,8 @@
 //   using namespace clod;
 //
 // It pulls in, in dependency order: the host/device contract and grid helpers, the
-// bounds-checked bump allocators, device math and frustum culling, and the shared
-// software rasteriser.
+// bounds-checked bump allocators, device math and frustum culling, the shared
+// software rasteriser, and the octree wireframe overlay.
 //
 // Sharing happens HERE, at NVRTC compile time, rather than by dispatching inside a
 // kernel. That is not a stylistic preference -- see the note in
@@ -21,3 +21,4 @@
 #include "shared/clod_math.cuh"
 #include "shared/clod_framebuffer.cuh"
 #include "shared/clod_draw.cuh"
+#include "shared/clod_lines.cuh"

@@ -8,6 +8,7 @@
 
 #include "clod/CudaCheck.h"
 #include "clod/CudaContext.h"
+#include "io/LasReader.h"
 #include "io/RawReader.h"
 
 namespace fs = std::filesystem;
@@ -26,20 +27,6 @@ double CloudMeta::worstQuantisationError() const {
 
 namespace {
 
-// Snap a translation to a power of two at or below `v`.
-//
-// Why bother: an f32 origin that is not exactly representable makes the SAME input
-// file produce slightly different device coordinates depending on rounding, which
-// silently breaks golden-image comparison and makes benchmark deltas untrustworthy.
-// A power of two is exact in f32 and stable across runs and across the files of a
-// multi-file load.
-double snapDownToPowerOfTwo(double v) {
-	if (v == 0.0 || !std::isfinite(v)) return 0.0;
-	const double magnitude = std::pow(2.0, std::floor(std::log2(std::fabs(v))));
-	// Round away from zero so the translated minimum stays >= 0.
-	return v < 0.0 ? -std::ceil(std::fabs(v) / magnitude) * magnitude
-	               : std::floor(v / magnitude) * magnitude;
-}
 
 // ---------------------------------------------------------------------------
 // A source whose points all live in device memory at once.
@@ -216,14 +203,40 @@ private:
 	uint64_t m_uploaded = 0;
 };
 
-// Finish a CloudMeta: derive the snapped translation and the post-translation size
-// from original-CRS bounds, then apply it to the points.
-void applyTranslation(CloudMeta& meta, std::vector<Point>& points) {
+// Derive the translation and the post-translation size from original-CRS bounds.
+//
+// The translation is exactly -boxMin, which is what makes "boxMin is the origin by
+// construction" (HostDeviceCommon.h) true rather than aspirational.
+//
+// It used to snap down to a power of two, on the theory that a power of two is exactly
+// representable in f32 and therefore stable across runs. That reasoning only ever held
+// up on already-translated input. A UTM cloud has min_x = 693414.98, whose power of two
+// below is 524288 -- so a 1.3 km cloud kept a 169 km offset, the octree root cube came
+// out 170424 units wide, and every point landed in one corner of it: 36M points, 29
+// nodes, one leaf holding 7.04M of them. Only `.simlod` hid this, because SimLOD's own
+// converter has already subtracted the minimum, so min is exactly 0 and both rules
+// agree on a translation of 0.
+//
+// What is given up is that the translation is no longer guaranteed exact in f32. That
+// costs nothing where it is applied: readers holding f64 coordinates (LAS/LAZ) apply it
+// in f64 before narrowing, and a reader whose coordinates are already f32 has an f32
+// minimum, so -min is exact there anyway.
+//
+// Split from applyTranslation because an f64 reader needs the translation BEFORE it
+// produces points -- folding it into the parse is what keeps the low bits that a
+// post-pass over f32 points has already discarded.
+void deriveTranslation(CloudMeta& meta) {
 	for (int i = 0; i < 3; ++i) {
-		meta.translation[i] = -snapDownToPowerOfTwo(meta.boxMinOrig[i]);
+		meta.translation[i] = -meta.boxMinOrig[i];
 		meta.boxSize[i] = static_cast<float>(meta.boxMaxOrig[i] +
 		                                    meta.translation[i]);
 	}
+}
+
+// Finish a CloudMeta for a reader whose points are already float32 in original
+// coordinates (.simlod, synthetic): derive the translation, then shift in f32.
+void applyTranslation(CloudMeta& meta, std::vector<Point>& points) {
+	deriveTranslation(meta);
 	// Points arrive in original coordinates; shift them once, here, so device code
 	// only ever sees origin-relative float32.
 	const float tx = static_cast<float>(meta.translation[0]);
@@ -235,6 +248,123 @@ void applyTranslation(CloudMeta& meta, std::vector<Point>& points) {
 		p.y += ty;
 		p.z += tz;
 	}
+}
+
+// Load a LAS/LAZ cloud whole. Returns points already translated -- the caller must
+// NOT call applyTranslation on them.
+//
+// The order here is the interesting part. The bounding box comes from the header
+// (float64) and the translation is derived from it BEFORE a single point is parsed,
+// so the shift can be folded into the parse and applied at full precision. That is
+// also why the box is not recomputed from the points afterwards, the way the .simlod
+// reader has to: for LAS the header box IS the input. CudaLOD and SimLOD both size
+// the octree root cube from it, so recomputing it would silently produce a different
+// tree from the one the reference produced on the same file -- which is precisely the
+// provenance question in bench/reference/README.md that this reader exists to settle.
+bool loadLasCloud(const std::string& path, CloudMeta& meta,
+                  std::vector<Point>& points, std::string* err) {
+	LasHeaderInfo info;
+	if (!readLasHeader(path, info, err)) return false;
+
+	meta.numPoints = info.numPoints;
+	for (int i = 0; i < 3; ++i) {
+		meta.boxMinOrig[i] = info.min[i];
+		meta.boxMaxOrig[i] = info.max[i];
+	}
+	meta.files = {path};
+	meta.hasCompressed = info.compressed;
+	deriveTranslation(meta);
+
+	points.resize(info.numPoints);
+
+	// A header bbox that does not contain its own points is a real and common defect,
+	// and it is not cosmetic here: the octree root cube IS the box, so a point below it
+	// is out of the grid. Neither pipeline faults on that -- CudaLOD clamps the cell
+	// index and SimLOD's float-to-uint32 conversion saturates, both landing on cell 0 --
+	// which is worse than a fault, because the result is a silent pile of points in one
+	// corner cell. That is also the shape that walks into the unchecked capacities
+	// makeSyntheticSource documents below, so it can turn into a fault somewhere with no
+	// visible connection to the input.
+	//
+	// The low side cannot be fixed after the fact -- the translation was derived from
+	// it, and every point has already been shifted by it -- so the recovery is to take
+	// the minimum we actually observed and parse again. Twice at most: the second parse
+	// is measured against a box that provably contains the points.
+	double bounds[6] = {};
+	for (int attempt = 0; attempt < 2; ++attempt) {
+		const bool ok =
+			info.compressed
+				? readLazPoints(path, info, meta.translation, points.data(), bounds, err)
+				: readLasPoints(path, info, meta.translation, points.data(), bounds, err);
+		if (!ok) return false;
+
+		// Slack for the low side: LAS stores coordinates as integers times `scale`, and
+		// writers exist that compute the header bbox from the unquantised values, so a
+		// declared minimum can sit a fraction of a quantisation step above the smallest
+		// point actually stored. A negative that small is harmless -- it truncates to
+		// grid index 0 -- and re-parsing every such file would be a lot of I/O to move a
+		// point by less than the file's own precision.
+		bool underflow = false;
+		for (int i = 0; i < 3; ++i) {
+			const double slack = info.scale[i] +
+			                     static_cast<double>(meta.boxSize[i]) * 0x1p-23;
+			if (bounds[i] < -slack) underflow = true;
+		}
+		if (!underflow) break;
+
+		if (attempt == 1) {
+			// Cannot happen from a static file: the box was just derived from these very
+			// points. Refuse rather than loop.
+			if (err) {
+				*err = "LAS bounding box does not converge; is the file being written "
+				       "underneath us? " + path;
+			}
+			return false;
+		}
+
+		printf("clodgen: WARNING -- %s declares a minimum above its own points; "
+		       "re-reading against the observed box. Structural counts will not match "
+		       "a reference that trusted the header.\n",
+		       path.c_str());
+		for (int i = 0; i < 3; ++i) {
+			meta.boxMinOrig[i] =
+				std::min(meta.boxMinOrig[i], bounds[i] - meta.translation[i]);
+			meta.boxMaxOrig[i] =
+				std::max(meta.boxMaxOrig[i], bounds[3 + i] - meta.translation[i]);
+		}
+		deriveTranslation(meta);
+	}
+
+	// The high side needs no re-parse: growing the box leaves the translation, and so
+	// every point, exactly where it is.
+	//
+	// Only worth a warning when the excess is bigger than the low side's slack. A
+	// header maximum a fraction of a quantisation step short of its own points is the
+	// same unquantised-bbox sloppiness, it is silently correct to absorb, and warning
+	// about it on every load of every such file would train the reader to ignore the
+	// message that matters.
+	bool grewMaterially = false;
+	for (int i = 0; i < 3; ++i) {
+		if (bounds[3 + i] > meta.boxSize[i]) {
+			const double slack =
+				info.scale[i] + static_cast<double>(meta.boxSize[i]) * 0x1p-23;
+			if (bounds[3 + i] - meta.boxSize[i] > slack) grewMaterially = true;
+			meta.boxSize[i] = static_cast<float>(bounds[3 + i]);
+			meta.boxMaxOrig[i] = bounds[3 + i] - meta.translation[i];
+		}
+	}
+	if (grewMaterially) {
+		// Loud, because it means the tree built from this file is NOT the tree another
+		// reader of the same file builds.
+		printf("clodgen: WARNING -- %s declares a bounding box smaller than its "
+		       "points; grown to [%.3f %.3f %.3f]. Structural counts will not match "
+		       "a reference that trusted the header.\n",
+		       path.c_str(), static_cast<double>(meta.boxSize[0]),
+		       static_cast<double>(meta.boxSize[1]),
+		       static_cast<double>(meta.boxSize[2]));
+	}
+
+	return true;
 }
 
 }  // namespace
@@ -351,11 +481,11 @@ std::unique_ptr<PointSource> openPointSource(
 	if (ext == ".simlod") {
 		if (!readSimlod(path, meta, points, err)) return nullptr;
 	} else if (ext == ".las" || ext == ".laz") {
-		if (err) {
-			*err = "reading " + ext +
-			       " is not implemented yet; convert to .simlod, or use --synthetic";
-		}
-		return nullptr;
+		// Returns already-translated points: the shift is folded into the parse so it
+		// happens in f64. Do not add applyTranslation to this branch.
+		if (!loadLasCloud(path, meta, points, err)) return nullptr;
+		return std::make_unique<ResidentSource>(cuda, std::move(meta),
+		                                        std::move(points));
 	} else {
 		if (err) *err = "unrecognised extension: " + ext;
 		return nullptr;

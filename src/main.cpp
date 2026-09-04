@@ -199,6 +199,12 @@ void printUsage() {
 		"  --switch-to <id>    request a runtime pipeline switch (see --switch-after),\n"
 		"                      so the switch path is scriptable and not GUI-only\n"
 		"  --switch-after <n>  frame at which to switch (default 0)\n"
+		"  --show-bounds       draw a wireframe cube per selected node, coloured by\n"
+		"                      level -- the LOD cut itself. `flat` has no tree and\n"
+		"                      draws none.\n"
+		"  --hide-points       do not rasterise samples. With --show-bounds this\n"
+		"                      leaves the octree structure alone on screen, which is\n"
+		"                      the only way to read it in a dense cloud.\n"
 		"  --strict-timing     synchronise and read CUevents every frame.\n"
 		"                      Accurate but slower; required for benchmarking,\n"
 		"                      since the default reads timings one frame late.\n"
@@ -275,6 +281,10 @@ int main(int argc, char** argv) {
 			std::string n;
 			if (!takeArg(argc, argv, i, "--switch-after", &n)) return 2;
 			options.switchAfterFrames = std::atoi(n.c_str());
+		} else if (arg == "--show-bounds") {
+			options.showBoundingBox = true;
+		} else if (arg == "--hide-points") {
+			options.hidePoints = true;
 		} else if (arg == "--strict-timing") {
 			options.strictTiming = true;
 		} else if (!arg.empty() && arg[0] != '-') {

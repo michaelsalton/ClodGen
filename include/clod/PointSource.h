@@ -43,13 +43,15 @@ struct CloudMeta {
 	double boxMaxOrig[3] = {0, 0, 0};
 
 	// Subtracted from every point on the host, so device coordinates start at the
-	// origin and fit float32.
+	// origin and fit float32. Exactly -boxMinOrig: the octree root cube is sized from
+	// boxSize with its minimum ASSUMED to be the origin, so any slack left here is
+	// slack the whole tree is built on. See deriveTranslation for what a coarser rule
+	// did to a UTM cloud.
 	//
-	// Snapped to a power of two below the true minimum, so it is exactly
-	// representable in f32 AND bit-identical across runs and across the files of a
-	// multi-file load. Without that, loading the same data twice can differ in the
-	// last bits, which quietly ruins golden-image comparison and makes benchmark
-	// deltas untrustworthy.
+	// A reader holding f64 coordinates must apply this in f64 and narrow afterwards,
+	// not add it to points it has already rounded to f32 -- at UTM magnitudes an f32
+	// coordinate has ~4 cm of resolution, and the translation is what buys the
+	// sub-millimetre resolution worstQuantisationError() reports.
 	double translation[3] = {0, 0, 0};
 
 	float boxSize[3] = {0, 0, 0};  // post-translation extent

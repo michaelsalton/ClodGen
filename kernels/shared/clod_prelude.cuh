@@ -82,15 +82,38 @@ inline uint32_t clodPackRGBA(uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
 	return r | (g << 8) | (b << 16) | (a << 24);
 }
 
-// Cheap integer hash, for colour-by-node debug shading.
+// Cheap integer hash, for colour-by-node / colour-by-LOD debug shading and the octree
+// wireframe.
+//
+// Two things here are corrections, not decoration, and both are about a debug view being
+// USELESS rather than merely ugly when it goes wrong:
+//
+//   1. The key is OFFSET before hashing. A multiply-xor hash maps 0 to 0, so key 0 came
+//      out pure black -- and key 0 is not a rare case: `flat` reports every slice as
+//      level 0, so colour-by-LOD rendered the entire control condition invisible, and
+//      CudaLOD holds the root unconditionally visible, so its outermost wireframe cube
+//      was always the one you could not see.
+//
+//   2. Channels are lifted into [96,255]. An unconstrained hash produces near-black
+//      colours for ~1 in 20 keys, which on the dark clear colour are indistinguishable
+//      from nothing being drawn there. Some hue distinguishability is traded for the
+//      guarantee that every node is actually visible; for a debug view that is the right
+//      way round.
+//
+// Exact colours therefore differ from earlier builds. Nothing measured depends on them
+// (bench/reference/ holds structural counts, not images), but a screenshot from before
+// this change will not match one from after.
 inline uint32_t clodHashColor(uint64_t key) {
-	uint64_t h = key * 0x9E3779B97F4A7C15ull;
+	uint64_t h = (key + 0x9E3779B97F4A7C15ull) * 0x9E3779B97F4A7C15ull;
 	h ^= h >> 29;
 	h *= 0xBF58476D1CE4E5B9ull;
 	h ^= h >> 32;
-	return clodPackRGBA(static_cast<uint32_t>(h) & 0xFFu,
-	                    static_cast<uint32_t>(h >> 8) & 0xFFu,
-	                    static_cast<uint32_t>(h >> 16) & 0xFFu, 255u);
+
+	// byte -> [96, 255]
+	auto channel = [](uint64_t bits) {
+		return 96u + ((static_cast<uint32_t>(bits) & 0xFFu) * 159u) / 255u;
+	};
+	return clodPackRGBA(channel(h), channel(h >> 8), channel(h >> 16), 255u);
 }
 
 }  // namespace clod

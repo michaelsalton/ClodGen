@@ -242,6 +242,13 @@ void clodRasterizeDrawList(const DrawList& list, uint64_t* fb,
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
 
+	// A VIEW toggle, not a selection change. Selection has already run and the draw
+	// list is intact, so diag->drawItems / drawSamples still report what the pipeline
+	// CHOSE -- turning points off does not make a frame look cheaper than it was.
+	// Hiding them is how the octree wireframe becomes readable: four million samples
+	// bury the cubes that bound them.
+	if (u.showPoints == 0) return;
+
 	// Read the count once per block rather than once per iteration.
 	__shared__ uint32_t sh_numItems;
 

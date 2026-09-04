@@ -245,7 +245,7 @@ The header's provenance fields all come from things that already exist: `CudaCon
 
 ## 3. Staging
 
-**Stage 1 — Layers 1 + 2.** `GpuProfiler`, `GpuScope`, `FrameContext` wiring, all three pipelines converted, sample retention and percentiles, panel updated. Self-contained, no device-code changes, no new output format. Delivers real SimLOD and CudaLOD render times with distributions on day one — which is the metric the research is missing and the reason this stage is first.
+**Stage 1 — Layers 1 + 2. DONE.** `GpuProfiler`, `GpuScope`, `FrameContext` wiring, all three pipelines converted, sample retention and percentiles, panel updated. Self-contained, no device-code changes, no new output format. Delivers real SimLOD and CudaLOD render times with distributions on day one — which is the metric the research is missing and the reason this stage is first. See §7 for what it measured and for one defect the audit in §1 understated.
 
 **Stage 2 — Layer 4.** `--bench`, the orbit path, NDJSON. Turns the instrument into data on disk and makes `bench/reference/` reproducible rather than transcribed. Depends on Stage 1 only.
 
@@ -262,7 +262,7 @@ The instrument is necessary but not sufficient; the protocol is what makes the n
 - **Report median and IQR over ≥300 post-warm-up frames**, not a mean over whatever the run happened to do. Means over GPU frame times are dominated by the tail, and the tail is exactly what a progressive builder produces.
 - **Name the configuration in every claim.** The reference README's own lesson: CudaLOD's `WEIGHTED_NEIGHBORHOOD` voxelises 13× slower than `FIRST_COME` for bit-identical tree structure, so "CudaLOD does N MP/s" without naming the strategy is not a claim. The same will be true of any SimLOD number without the batch size and the device-side time budget.
 - **Use `ncu` for what a hand-rolled profiler cannot see** — occupancy, achieved memory throughput, warp-stall reasons. One caveat specific to this codebase: every kernel here is a cooperative launch, and Nsight Compute's default kernel-level replay does not support grid-wide sync. Use `--replay-mode application`.
-- **Record the input's provenance.** Already learned the hard way and documented in `bench/reference/README.md`: the same points read from `.las` versus `.simlod` produce a bounding box differing in the last f32 bit, which shifts CudaLOD's voxel grid and changes the voxel count by 388. Bounding-box provenance is part of the input, so the header records the file actually read.
+- **Record the input's provenance** — the file actually read, not just the point count. The original version of this bullet asserted that `.las` versus `.simlod` differ in the last f32 bit of the bounding box and that this is what shifts CudaLOD's voxel grid by 388 voxels. The `.las` reader has since landed and refuted it: all three formats give 12,742,500 voxels and byte-identical frames, because `Metadata::max_x` is a `float` and both headers narrow to the same value (see `bench/reference/README.md`). Provenance still belongs in the record — a run whose input you cannot name is not reproducible — but the +388 needs another explanation, and it is not the box.
 
 ---
 
@@ -332,3 +332,116 @@ Each stage has a concrete acceptance test, and one of them is an oracle that alr
 - `nanotime()` (`kernels/simlod/utils.h.cu:322-327`) — the device clock read; do not write a second one.
 - `PipelineStats` health flags (`include/clod/ILodPipeline.h:126-131`) — per-sample `warn` and the harness exit code.
 - `now()`, `formatNumber()`, `writeFile()` from `include/clod/unsuck.hpp`.
+
+---
+
+## 7. Stage 1 as built
+
+Landed as described, with three deviations and one correction to the audit above.
+
+### 7.1 Defect 1.1 was worse than stated
+
+§1.1 says only `FlatPipeline` filled `renderDeviceMsLast`. It did — but **only under
+`--strict-timing`**. In the default regime `FlatPipeline::render` queried the event pair
+it had just re-recorded three lines earlier, so `cuEventElapsedTime` returned
+`CUDA_ERROR_NOT_READY` on every frame and the assignment never happened. The comment
+there described reading "last frame's numbers", which needs a double-buffered pair; the
+code had one pair. So in a default run **no pipeline had a render time**, not two of
+three. Measured before the change: `flat` printed `0.00` by default and `0.18` with
+`--strict-timing`, same scene.
+
+The profiler removes the failure mode rather than fixing the arithmetic: events are
+pooled and recycled, and a sample whose events are not ready is left for the next
+frame's harvest pass instead of being read early and discarded.
+
+### 7.2 Deviations from §2
+
+- **`GpuScope` takes a pointer, not a reference.** `FrameContext::profiler` is
+  documented as never null in a normal frame, but a null dereference inside a render
+  loop is a worse failure than an unmeasured scope, and a headless path that forgets to
+  set it should not crash.
+- **`TimingScopes timingScopes()` was added to `ILodPipeline`.** §2 left the shell to
+  find a pipeline's scopes; nothing said how. Inferring them from the pipeline id and a
+  naming convention would work right up until a pipeline added a phase and quietly
+  stopped being counted, which is the same class of silent gap as defect 1.1. Pipelines
+  declare their scope names; `buildTotals()` sums them.
+- **`gui()` takes the profiler as a parameter** rather than the pipeline stashing one
+  during `build()`. Same reason `FrameContext` exists.
+
+The three public doubles are gone, as §2 planned for the end of Layer 2. `BuildTotals`
+replaces them and carries a `measured` flag, so "no build scope produced a sample" is
+distinguishable from "the build took 0.00 ms" — a distinction the old interface could
+not express. `GpuProfiler::find()` returns null for a scope with no samples in the
+current regime, and `timingRow()` renders that as `not measured`.
+
+### 7.3 Clearing policy
+
+Samples are dropped exactly when they stop describing the same work:
+
+- **On cloud load** — the whole profiler. A new scene invalidates everything.
+- **NOT on a pipeline switch.** The cloud, camera and pixel budget are unchanged, so
+  keeping `flat.render` alongside `simlod.render` is the entire point — the control
+  condition and the thing being measured, side by side. Verified: after
+  `--switch-to cudalod --switch-after 20`, both scopes are present in one output.
+- **On a SimLOD reset**, `simlod.*` only. The tree those samples describe is gone.
+- **On a CudaLOD strategy change**, `cudalod.*` only. `WEIGHTED_NEIGHBORHOOD` voxelises
+  ~13× slower than `FIRST_COME` for a bit-identical tree, so a median pooled across two
+  strategies describes neither. Repeated rebuilds at a *fixed* strategy deliberately do
+  accumulate — press rebuild ten times and the median is worth more than any one run.
+
+### 7.4 Acceptance, measured
+
+RTX 5080, 84 SMs, sm_120, clocks not locked.
+
+`--pipeline cudalod --open morro_bay_36M.simlod --strict-timing`, strategy 0, against
+the reference table in `bench/reference/README.md`:
+
+| scope | reference | measured | run 2 |
+|---|---|---|---|
+| `cudalod.split` | 5.1 ms | 4.99 ms | 5.14 ms |
+| `cudalod.voxelize` | 4.1 ms | 4.08 ms | 4.06 ms |
+
+Within ~2%, with the structural invariants intact (36,200,706 points, 2,252 nodes). The
+oracle §5 asked for holds for strategy 0. **Strategies 2 and 3 are not yet verifiable
+from a script**: the sampling strategy is a GUI-only radio button, so `--bench` in Stage
+2 has to reach it. That also leaves the strategy-change clearing path in §7.3 exercised
+only by hand.
+
+`--pipeline simlod --open morro_bay_36M.simlod --strict-timing`, 400 frames:
+
+```
+simlod.construct  n=4    med  10.151  p95  10.547  min 10.142  max 10.547  total 41.04
+simlod.render     n=399  med   0.193  p95   0.195  min  0.156  max  0.197
+simlod.reset      n=1    med   3.502
+```
+
+Two things the running sum could not have shown:
+
+1. **The device-side 10 ms `MAX_PROCESSING_TIME` budget holds**, and the overshoot is
+   bounded: p95 is 10.55 ms against a 10 ms budget, max 10.55 ms. That is the shape §1.2
+   argued for, and it is now one number rather than an assumption.
+2. **`simlod.reset` costs 3.5 ms** — a one-block, one-thread kernel zeroing
+   `BATCH_STREAM_SIZE` entries, which was never timed by anything and is 35% of a
+   construct launch. It is in the build total now because §5's rule is that "cheap" is a
+   measurement, not an assumption.
+
+Render times now exist for all three pipelines in *both* regimes. On the same cloud,
+camera and pixel budget: `flat.render` 0.760 ms median (36.2M points, no selection)
+against `cudalod.render` 0.105 ms median (374k visible samples). That comparison was
+not previously expressible.
+
+Profiler overhead is not measurable: three runs each of strict and deferred are all
+vsync-bound at a 16.6–16.8 ms median, indistinguishable from each other.
+
+### 7.5 Files, as built
+
+New: `include/clod/GpuProfiler.h`, `src/shell/GpuProfiler.cpp`,
+`src/shell/TimingUi.{h,cpp}` (one place that decides what an unmeasured scope looks
+like, shared by the panel and all three `gui()`s).
+
+Modified: `include/clod/ILodPipeline.h`, all three pipelines, `src/shell/App.{h,cpp}`,
+`src/shell/SettingsPanel.cpp`, `CMakeLists.txt`. No device code was touched, so
+`--check-kernels` still reports 6 programs from 8 modules, 0 failed.
+
+`--dump-frame` now prints a per-scope table (n, last, median, p95, min, max, total) and
+names the regime, which is the readout Stage 2 formalises into NDJSON.

@@ -9,8 +9,10 @@
 
 #include "clod/CudaCheck.h"
 #include "clod/CudaContext.h"
+#include "clod/GpuProfiler.h"
 #include "clod/PointSource.h"
 #include "clod/unsuck.hpp"  // now()
+#include "shell/TimingUi.h"
 
 // SimLOD's own host/device contract, vendored unmodified. Deliberately NOT merged into
 // clod/HostDeviceCommon.h: rewriting the struct the reference kernels read is how a port
@@ -45,12 +47,6 @@ constexpr uint64_t kMinPersistentBytes = 512ull << 20;
 
 constexpr uint64_t kBytesPerPixelScratch = 64;
 constexpr uint64_t kMinScratchBytes = 64ull << 20;
-
-float eventMs(CUevent start, CUevent end) {
-	float ms = 0.0f;
-	if (cuEventElapsedTime(&ms, start, end) != CUDA_SUCCESS) return 0.0f;
-	return ms;
-}
 
 }  // namespace
 
@@ -166,9 +162,6 @@ bool SimlodPipeline::allocate(const CloudMeta& meta, const DeviceBudget& budget,
 		return false;
 	}
 
-	CLOD_CU(cuEventCreate(&m_buildStart, CU_EVENT_DEFAULT));
-	CLOD_CU(cuEventCreate(&m_buildEnd, CU_EVENT_DEFAULT));
-
 	m_stats.numPoints = 0;
 	m_stats.bytesAllocated = m_persistentBytes + m_momentaryBytes + m_nodesBytes;
 	m_needsReset = true;
@@ -187,23 +180,25 @@ void SimlodPipeline::release() {
 	}
 	m_momentaryBytes = m_persistentBytes = m_nodesBytes = m_scratchBytes = 0;
 
-	for (CUevent* e : {&m_buildStart, &m_buildEnd}) {
-		if (*e) {
-			cuEventDestroy(*e);
-			*e = nullptr;
-		}
-	}
 	m_complete = false;
 	m_needsReset = true;
 }
 
 void SimlodPipeline::reset() {
+	// The timing samples are dropped by build(), where the profiler is in hand -- see
+	// the reset branch there.
 	m_needsReset = true;
 	m_complete = false;
-	buildDeviceMsTotal = 0.0;
-	buildLaunchCount = 0;
-	m_lastBuildMs = 0.0;
 	m_batchesConsumed = 0;
+}
+
+TimingScopes SimlodPipeline::timingScopes() const {
+	TimingScopes scopes;
+	// Both construction launches, or the reported build total under-reports. reset is
+	// one block and cheap, but "cheap" is a measurement, not an assumption.
+	scopes.build = {"simlod.reset", "simlod.construct"};
+	scopes.render = "simlod.render";
+	return scopes;
 }
 
 void SimlodPipeline::fillUniforms(const FrameContext& frame, void* out) const {
@@ -258,12 +253,21 @@ bool SimlodPipeline::build(PointSource& source, const FrameContext& frame) {
 		void* resetArgs[] = {&uniforms,  &persistent,    &nodes,     &statsPtr,
 		                     &cudaPrint, &resetUploaded, &resetSizes};
 
+		// The tree the previous samples describe no longer exists, and a distribution
+		// spanning two different trees describes neither. Drop them here rather than in
+		// reset(), which does not have the profiler.
+		if (frame.profiler) frame.profiler->clearPrefix("simlod.");
+
 		// One block, one thread -- but a COOPERATIVE launch, because reset.cu calls
 		// grid.sync(). A plain cuLaunchKernel makes that undefined, and the failure mode is
 		// a bare CUDA_ERROR_LAUNCH_FAILED ("unspecified launch failure") that says nothing
 		// about the cause. Every kernel in both reference pipelines grid-syncs, so
 		// cooperative launch is the rule here, not the exception.
-		CLOD_CU(cuLaunchCooperativeKernel(resetKernel, 1, 1, 1, 1, 1, 1, 0, 0, resetArgs));
+		{
+			GpuScope scope(frame.profiler, "simlod.reset");
+			CLOD_CU(cuLaunchCooperativeKernel(resetKernel, 1, 1, 1, 1, 1, 1, 0, 0,
+			                                  resetArgs));
+		}
 
 		const CUresult sync = cuCtxSynchronize();
 		if (isStickyError(sync)) {
@@ -296,21 +300,18 @@ bool SimlodPipeline::build(PointSource& source, const FrameContext& frame) {
 	// Upstream launches this at exactly 1 block per SM.
 	const int grid = m_cuda.gridForKernel(construct, m_blockSize, 1);
 
-	CLOD_CU(cuEventRecord(m_buildStart, 0));
-	CLOD_CU(cuLaunchCooperativeKernel(construct, static_cast<unsigned>(grid), 1, 1,
-	                                  static_cast<unsigned>(m_blockSize), 1, 1, 0, 0,
-	                                  args));
-	CLOD_CU(cuEventRecord(m_buildEnd, 0));
+	{
+		GpuScope scope(frame.profiler, "simlod.construct");
+		CLOD_CU(cuLaunchCooperativeKernel(construct, static_cast<unsigned>(grid), 1, 1,
+		                                  static_cast<unsigned>(m_blockSize), 1, 1, 0, 0,
+		                                  args));
+	}
 
 	const CUresult sync = cuCtxSynchronize();
 	if (isStickyError(sync)) {
 		reportDeadContextAndExit(sync, "SimLOD kernel_construct");
 	}
 	CLOD_CU(sync);
-
-	m_lastBuildMs = eventMs(m_buildStart, m_buildEnd);
-	buildDeviceMsTotal += m_lastBuildMs;
-	++buildLaunchCount;
 
 	readStats();
 
@@ -388,9 +389,15 @@ void SimlodPipeline::render(const FrameContext& frame) {
 	void* kernelArgs[] = {&args, &nodes, &statsPtr, &diag};
 
 	const int grid = m_cuda.gridForKernel(kernel, m_blockSize);
-	CLOD_CU(cuLaunchCooperativeKernel(kernel, static_cast<unsigned>(grid), 1, 1,
-	                                  static_cast<unsigned>(m_blockSize), 1, 1, 0, 0,
-	                                  kernelArgs));
+	{
+		// The measurement that did not exist before this layer: SimLOD's render kernel
+		// was launched with no events on either side, so the GUI's "render kernel" row
+		// showed a default-initialised 0.00 formatted exactly like a real number.
+		GpuScope scope(frame.profiler, "simlod.render");
+		CLOD_CU(cuLaunchCooperativeKernel(kernel, static_cast<unsigned>(grid), 1, 1,
+		                                  static_cast<unsigned>(m_blockSize), 1, 1, 0, 0,
+		                                  kernelArgs));
+	}
 
 	if (frame.strictTiming) {
 		const CUresult sync = cuCtxSynchronize();
@@ -410,7 +417,7 @@ void SimlodPipeline::render(const FrameContext& frame) {
 	}
 }
 
-void SimlodPipeline::gui() {
+void SimlodPipeline::gui(const GpuProfiler& profiler) {
 	ImGui::TextUnformatted(
 		"Progressive construction: one bounded launch per frame inserts\n"
 		"batches into the octree while it is being rendered.");
@@ -433,14 +440,26 @@ void SimlodPipeline::gui() {
 			ImGui::TableNextColumn();
 			ImGui::Text(fmt, v);
 		};
-		row("last launch", "%.2f ms", m_lastBuildMs);
-		row("build total", "%.2f ms", buildDeviceMsTotal);
-		row("launches", "%.0f", static_cast<double>(buildLaunchCount));
-		const double mps = buildDeviceMsTotal > 0.0
+
+		// A progressive build is hundreds of bounded launches, each governed by the
+		// device-side MAX_PROCESSING_TIME budget. The interesting question is the SHAPE
+		// of that distribution -- does the budget hold, and how does per-launch cost
+		// evolve as the octree deepens -- which a running sum cannot answer.
+		timingRow(profiler, "reset (ms)", "simlod.reset");
+		timingRow(profiler, "construct (ms)", "simlod.construct");
+		timingRow(profiler, "render (ms)", "simlod.render");
+
+		const BuildTotals totals = buildTotals(profiler, timingScopes());
+		row("build total", "%.2f ms", totals.ms);
+		row("launches", "%.0f", static_cast<double>(totals.launches));
+
+		// Ingest throughput is a whole-build figure, so it divides by the SUM over every
+		// launch -- unlike CudaLOD's, which is one build and uses the median.
+		const double mps = totals.ms > 0.0
 		                       ? double(m_stats.numPointsIngested) / 1e6 /
-		                             (buildDeviceMsTotal / 1000.0)
+		                             (totals.ms / 1000.0)
 		                       : 0.0;
-		row("throughput", "%.0f MP/s", mps);
+		row("throughput (build total)", "%.0f MP/s", mps);
 		row("persistent", "%.2f GB", double(m_persistentBytes) / 1e9);
 		row("high water", "%.2f GB", double(m_stats.bytesHighWater) / 1e9);
 		ImGui::EndTable();

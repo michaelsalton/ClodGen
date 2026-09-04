@@ -30,9 +30,14 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <cuda.h>
 
+// Included rather than forward-declared: every pipeline needs GpuScope at its launch
+// sites, so this is the header that makes the launch-site scope the path of least
+// resistance.
+#include "clod/GpuProfiler.h"
 #include "clod/HostDeviceCommon.h"
 
 namespace clod {
@@ -92,6 +97,13 @@ struct FrameContext {
 	// frame late. Recorded in results so the two modes cannot be compared by
 	// accident.
 	bool strictTiming = false;
+
+	// Shell-owned GPU timing. Never null in a normal frame; GpuScope tolerates null
+	// anyway so a headless path that forgets to set it does not crash. Every kernel
+	// launch belongs inside a GpuScope taken from this -- that is what makes "the
+	// pipeline forgot to measure its render kernel" impossible rather than merely
+	// unlikely.
+	GpuProfiler* profiler = nullptr;
 };
 
 // Normalised, pipeline-agnostic readback for the stats panel and the benchmark
@@ -131,6 +143,22 @@ struct PipelineStats {
 	bool allocOverflow = false;
 };
 
+// The GpuProfiler scope names this pipeline records.
+//
+// Declared rather than inferred, because the shell has to report "build device ms" and
+// "render device ms" for a pipeline whose phases it knows nothing about. Guessing them
+// from the pipeline id and a naming convention would work right up until a pipeline
+// added a phase and quietly stopped being counted -- which is the class of silent
+// measurement gap this whole layer exists to close.
+//
+// Names are flat and dotted, and they become column names in the benchmark output, so
+// they are part of the data format: change one and previously captured runs no longer
+// line up with new ones.
+struct TimingScopes {
+	std::vector<std::string> build;  // summed into the reported build total
+	std::string render;              // the per-frame render launch, empty if none
+};
+
 // ---------------------------------------------------------------------------
 
 class ILodPipeline {
@@ -168,16 +196,45 @@ public:
 
 	virtual const PipelineStats& stats() const = 0;
 
+	// The scopes this pipeline brackets its launches with. Must name every launch it
+	// makes, or that launch's cost is missing from every reported total.
+	virtual TimingScopes timingScopes() const = 0;
+
 	// ImGui for tunables this pipeline OWNS (sampling strategy, node capacity,
 	// batches per launch). Shared knobs belong to the shell so that every pipeline
 	// is guaranteed to get the same value.
-	virtual void gui() {}
-
-	// --- filled by the pipeline from CUevents; read by the benchmark harness ---
-	double buildDeviceMsTotal = 0.0;  // summed over ALL build launches
-	double renderDeviceMsLast = 0.0;
-	uint32_t buildLaunchCount = 0;
+	//
+	// The profiler is handed in rather than stashed on the pipeline during build():
+	// everything a pipeline needs arrives as a parameter, which is the property that
+	// lets more than one of them exist.
+	virtual void gui(const GpuProfiler& profiler) { (void)profiler; }
 };
+
+// Sum of a pipeline's build scopes, and the count of launches behind it.
+//
+// This replaces the `buildDeviceMsTotal` / `buildLaunchCount` / `renderDeviceMsLast`
+// members that used to live on ILodPipeline. They were filled inconsistently -- two of
+// the three pipelines never wrote the render one at all -- and a default-initialised
+// double is indistinguishable from a measured zero. Derived from the profiler, an
+// unrecorded scope is absent rather than zero.
+struct BuildTotals {
+	double ms = 0.0;
+	uint64_t launches = 0;
+	bool measured = false;  // false when no build scope produced a sample
+};
+
+inline BuildTotals buildTotals(const GpuProfiler& profiler,
+                               const TimingScopes& scopes) {
+	BuildTotals totals;
+	for (const std::string& name : scopes.build) {
+		const ScopeStats* s = profiler.find(name);
+		if (!s) continue;
+		totals.ms += s->total();
+		totals.launches += s->count();
+		totals.measured = true;
+	}
+	return totals;
+}
 
 using PipelineFactory = std::function<std::unique_ptr<ILodPipeline>()>;
 

@@ -24,8 +24,7 @@ thing that mutates it and the only thing that consumes budget — which is what 
 "how much refinement budget the system got" the single independent variable of the
 evaluation. Keep that separation.
 
-Read `plans/tempnotes.md` for the current shape of the design, and
-`plans/01_NoveltyAssessment.md` before touching LOD selection metrics, node budgets or
+Read `wiki` and 'plans' for the current shape of the design before touching LOD selection metrics, node budgets or
 split criteria.
 
 ## The shared path
@@ -60,8 +59,13 @@ There is no test suite yet: `tests/unit/` is empty and `CLODGEN_BUILD_TESTS` is 
 `make test` currently runs ctest against nothing. Verification today is
 `--check-kernels`, `--dump-frame` and the structural counts in `bench/reference/`.
 
-Only `.simlod` loads — the `.las` / `.laz` readers are not implemented. Data lives under
-`data/` and is gitignored; do not assume a cloud is present.
+`.simlod`, `.las` and `.laz` all load, whole-cloud, and produce **bit-identical trees and
+byte-identical frames** from the same cloud — which is the strongest verification the
+readers have, and worth re-running after touching any of them (`--dump-frame` plus `cmp`).
+Load rates on morro_bay: `.simlod` ~100 MP/s, `.las` ~110–140 MP/s (eight loader threads),
+`.laz` ~5 MP/s (laszip, single-threaded by necessity — see the banner in
+`src/io/LazReader.cpp`). Data lives under `data/` and is gitignored; do not assume a cloud
+is present.
 
 ## Layout
 
@@ -124,6 +128,15 @@ proposing a design that assumes otherwise.
   thread walks the identical allocation sequence. No `alloc()` behind a branch, in a
   data-dependent condition, or in a loop with a varying trip count. See the banner in
   `kernels/shared/clod_alloc.cuh`.
+- **The root cube assumes translated `boxMin` is exactly the origin**, and nothing on the
+  device checks it. `CloudMeta::translation` is therefore exactly `-boxMinOrig`; the
+  coarser rule it used to be (snap down to a power of two) left a 1.3 km UTM cloud sitting
+  169 km off origin, which sized the root cube at 170424 units and collapsed 36M points
+  into 29 nodes with 7.04M in one leaf. Any new reader must land every point in
+  `[0, boxSize]`; nothing on the device will complain if it doesn't, because CudaLOD
+  clamps the cell index and SimLOD's float→uint32 conversion saturates, so out-of-box
+  points pile into cell 0 instead of faulting. `loadLasCloud` therefore checks the
+  observed bounds itself and re-reads against a corrected box.
 
 ## Reporting numbers
 
@@ -151,12 +164,29 @@ proposing a design that assumes otherwise.
   than continuing. Continuing previously produced a cascade of errors, then host heap
   corruption, then a SIGSEGV in a file-watcher thread — a trail pointing nowhere near the
   cause. Keep that fail-fast behaviour.
-- Timing instrumentation is incomplete: only `FlatPipeline` fills `renderDeviceMsLast`,
-  so the GUI prints a plausible-looking `0.00` for the other two. Treat render-time
-  numbers from `simlod`/`cudalod` as absent, not zero. See `plans/02_ProfilingTools.md`.
 - A GUI-only code path is an untested code path. `--switch-to` / `--switch-after` and
   `--dump-frame` exist so the switch and render paths are scriptable; keep new controls
-  reachable from the command line.
+  reachable from the command line. **CudaLOD's sampling strategy is still GUI-only**,
+  which is why only strategy 0 of the `bench/reference/` oracle can be checked from a
+  script; `--bench` (Stage 2 of `plans/02_ProfilingTools.md`) has to reach it.
+
+## Timing
+
+Stage 1 of `plans/02_ProfilingTools.md` has landed, so timing is now shell-owned:
+
+- **Every kernel launch goes inside a `GpuScope`** taken from `FrameContext::profiler`.
+  A launch outside one does not appear in any total. `ILodPipeline::timingScopes()`
+  declares the names, and a pipeline that adds a phase without adding it there silently
+  stops being counted — that is the one way back into the defect this layer removed.
+- **A scope with no samples reports as absent, not `0.00`.** `GpuProfiler::find()`
+  returns null, `timingRow()` prints "not measured", and `BuildTotals::measured` says so.
+  Do not reintroduce a code path that formats an unmeasured scope as a number.
+- **Strict and deferred samples are never pooled.** `--strict-timing` synchronises and
+  attributes a sample to the frame that produced it; the default reads whenever
+  `cuEventQuery` says ready. Both regimes now produce render times for all three
+  pipelines. Name the regime whenever quoting a number.
+- Scope names are the data format (`simlod.construct`, `cudalod.voxelize`, …). Renaming
+  one breaks comparison against runs already captured.
 
 ## Deeper context — read when relevant
 
@@ -165,7 +195,9 @@ proposing a design that assumes otherwise.
   differentiated from (Sequential Point Trees, VoxelMap, Pauly et al.), and the
   evaluation plan. **Read before any work on LOD selection metrics, node budgets, or
   split criteria.**
-- `plans/02_ProfilingTools.md` — staged plan for the measurement layer. **Read before
-  touching timing, benchmarking or `ILodPipeline`'s counters.**
+- `plans/02_ProfilingTools.md` — staged plan for the measurement layer, with §7
+  recording what Stage 1 actually measured. **Read before touching timing, benchmarking
+  or `GpuProfiler`.** Stage 2 (`--bench`, NDJSON) and Stage 3 (`DeviceTimeline` under
+  `-DCLOD_PROFILE`) are still open.
 - `bench/reference/README.md` — capture methodology and the machine baselines were taken on.
 - `references/` — source papers (SimLOD, CudaLOD).

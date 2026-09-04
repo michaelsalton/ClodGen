@@ -98,6 +98,12 @@ extern "C" __global__ void kernel_render(RenderArgs args, Point* points,
 	clodApplyEDL(framebuffer, u);
 	grid.sync();
 
+	// Inert here by design: flat's items are point-array slices, not nodes, so they
+	// carry no box. It goes through the same seam anyway rather than being omitted --
+	// the control condition exercising the shared path is the whole point of `flat`.
+	clodDrawListWireframe(drawList, framebuffer, u);
+	grid.sync();
+
 	clodResolve(framebuffer, u, static_cast<cudaSurfaceObject_t>(args.surface));
 
 	// Publish what was drawn, so the stats panel is not guessing.

@@ -37,7 +37,8 @@ public:
 	void render(const FrameContext& frame) override;
 
 	const PipelineStats& stats() const override { return m_stats; }
-	void gui() override;
+	TimingScopes timingScopes() const override;
+	void gui(const GpuProfiler& profiler) override;
 
 private:
 	CudaContext& m_cuda;
@@ -52,9 +53,6 @@ private:
 	// source.
 	CUdeviceptr m_points = 0;
 	uint64_t m_numPoints = 0;
-
-	CUevent m_renderStart = nullptr;
-	CUevent m_renderEnd = nullptr;
 
 	PipelineStats m_stats;
 	int m_blockSize = 256;

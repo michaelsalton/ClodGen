@@ -4,7 +4,9 @@
 
 #include "clod/CudaCheck.h"
 #include "clod/CudaContext.h"
+#include "clod/GpuProfiler.h"
 #include "clod/PointSource.h"
+#include "shell/TimingUi.h"
 
 namespace clod {
 
@@ -60,11 +62,6 @@ bool FlatPipeline::allocate(const CloudMeta& meta, const DeviceBudget& budget,
 	}
 	CLOD_CU(cuMemsetD8(m_diagnostics, 0, sizeof(DeviceDiagnostics)));
 
-	if (!m_renderStart) {
-		CLOD_CU(cuEventCreate(&m_renderStart, CU_EVENT_DEFAULT));
-		CLOD_CU(cuEventCreate(&m_renderEnd, CU_EVENT_DEFAULT));
-	}
-
 	m_stats.bytesCapacity = budget.bytes;
 	return true;
 }
@@ -79,11 +76,6 @@ void FlatPipeline::release() {
 		CLOD_CU(cuMemFree(m_diagnostics));
 		m_diagnostics = 0;
 	}
-	if (m_renderStart) {
-		cuEventDestroy(m_renderStart);
-		cuEventDestroy(m_renderEnd);
-		m_renderStart = m_renderEnd = nullptr;
-	}
 	m_points = 0;
 	m_numPoints = 0;
 }
@@ -95,8 +87,13 @@ void FlatPipeline::reset() {
 		CLOD_CU(cuMemsetD8(m_diagnostics, 0, sizeof(DeviceDiagnostics)));
 	}
 	m_stats.allocOverflow = false;
-	buildDeviceMsTotal = 0.0;
-	buildLaunchCount = 0;
+}
+
+TimingScopes FlatPipeline::timingScopes() const {
+	TimingScopes scopes;
+	// Nothing to build -- build() only latches a device pointer, which is host work.
+	scopes.render = "flat.render";
+	return scopes;
 }
 
 bool FlatPipeline::build(PointSource& source, const FrameContext&) {
@@ -155,50 +152,46 @@ void FlatPipeline::render(const FrameContext& frame) {
 	// occupancy rather than hardcoding it.
 	const int grid = m_cuda.gridForKernel(kernel, m_blockSize);
 
-	CLOD_CU(cuEventRecord(m_renderStart, 0));
-	CLOD_CU(cuLaunchCooperativeKernel(kernel, static_cast<unsigned>(grid), 1, 1,
-	                                  static_cast<unsigned>(m_blockSize), 1, 1, 0,
-	                                  0, kernelArgs));
-	CLOD_CU(cuEventRecord(m_renderEnd, 0));
+	{
+		GpuScope scope(frame.profiler, "flat.render");
+		CLOD_CU(cuLaunchCooperativeKernel(kernel, static_cast<unsigned>(grid), 1, 1,
+		                                  static_cast<unsigned>(m_blockSize), 1, 1, 0,
+		                                  0, kernelArgs));
+	}
 
+	// The profiler harvests without stalling, so there is nothing to read here: in the
+	// deferred regime the sample lands on a later frame's pass, and in the strict regime
+	// on this frame's endFrame(). This is what the old code MEANT to do -- it queried
+	// the event pair it had just re-recorded, got CUDA_ERROR_NOT_READY every time, and
+	// so never assigned a render time at all outside --strict-timing.
 	if (frame.strictTiming) {
 		CLOD_CU(cuCtxSynchronize());
-		float ms = 0.0f;
-		if (cuEventElapsedTime(&ms, m_renderStart, m_renderEnd) == CUDA_SUCCESS) {
-			renderDeviceMsLast = ms;
-		}
-		DeviceDiagnostics diagnostics = {};
-		CLOD_CU(cuMemcpyDtoH(&diagnostics, m_diagnostics,
-		                     sizeof(DeviceDiagnostics)));
+	}
+
+	DeviceDiagnostics diagnostics = {};
+	if (cuMemcpyDtoH(&diagnostics, m_diagnostics, sizeof(DeviceDiagnostics)) ==
+	    CUDA_SUCCESS) {
 		m_stats.allocOverflow = diagnostics.allocOverflow != 0;
-			m_stats.numVisibleNodes = diagnostics.drawItems;
-			m_stats.numVisiblePoints = diagnostics.drawSamples;
+		m_stats.numVisibleNodes = diagnostics.drawItems;
+		m_stats.numVisiblePoints = diagnostics.drawSamples;
 		m_stats.bytesHighWater = diagnostics.allocHighWater;
-	} else {
-		// Read last frame's numbers: querying the events just recorded would stall
-		// the pipeline. Deliberately one frame stale, and recorded as such by the
-		// benchmark harness so the two modes are never mixed.
-		float ms = 0.0f;
-		if (cuEventElapsedTime(&ms, m_renderStart, m_renderEnd) == CUDA_SUCCESS) {
-			renderDeviceMsLast = ms;
-		}
-		DeviceDiagnostics diagnostics = {};
-		if (cuMemcpyDtoH(&diagnostics, m_diagnostics, sizeof(DeviceDiagnostics)) ==
-		    CUDA_SUCCESS) {
-			m_stats.allocOverflow = diagnostics.allocOverflow != 0;
-			m_stats.numVisibleNodes = diagnostics.drawItems;
-			m_stats.numVisiblePoints = diagnostics.drawSamples;
-			m_stats.bytesHighWater = diagnostics.allocHighWater;
-		}
 	}
 }
 
-void FlatPipeline::gui() {
+void FlatPipeline::gui(const GpuProfiler& profiler) {
 	ImGui::TextUnformatted(
 		"No LOD: every point is rasterised every frame.\n"
 		"This is the control condition and the image-quality ground truth\n"
 		"that LOD pipelines are compared against.");
 	ImGui::Separator();
+
+	if (ImGui::BeginTable("flat_timing", 2, ImGuiTableFlags_SizingStretchProp)) {
+		// The baseline every LOD renderer's cost is read against: this is what drawing
+		// the whole cloud with no selection at all costs on this scene.
+		timingRow(profiler, "render (ms)", "flat.render");
+		ImGui::EndTable();
+	}
+
 	ImGui::Text("render scratch: %.1f MB",
 	            static_cast<double>(m_scratchBytes) / (1024.0 * 1024.0));
 	if (m_program && m_program->isStale()) {

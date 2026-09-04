@@ -14,6 +14,7 @@
 
 #include "clod/CudaContext.h"
 #include "clod/GLInterop.h"
+#include "clod/GpuProfiler.h"
 #include "clod/HostDeviceCommon.h"
 #include "clod/ILodPipeline.h"
 #include "clod/PipelineRegistry.h"
@@ -51,6 +52,16 @@ struct AppOptions {
 	// untested code path.
 	std::string switchToPipeline;
 	int switchAfterFrames = 0;
+
+	// --show-bounds / --hide-points: the octree wireframe overlay, from the command
+	// line as well as the panel.
+	//
+	// Not a convenience. A GUI-only control is an untested control, and the structural
+	// view is exactly what --dump-frame should be able to capture -- "did the cut land
+	// where the previous commit put it" is a question about node boxes, and answering it
+	// from a script needs both of these reachable without a mouse.
+	bool showBoundingBox = false;
+	bool hidePoints = false;
 };
 
 // Shared shading/LOD settings. These live here, NOT in the pipeline, precisely so
@@ -116,6 +127,16 @@ private:
 	std::unique_ptr<PointSource> m_source;
 	CloudMeta m_meta;
 	DeviceBudget m_budget;
+
+	// GPU timing lives here, not in the pipelines, for the same reason the budget and
+	// the camera do: a pipeline that owns its own instrument can measure a different
+	// thing, or -- as two of the three did -- forget to measure at all.
+	GpuProfiler m_profiler;
+
+	// Host-side wall-clock frame time, in the same accumulator type the GPU scopes use.
+	// A 60 fps MEAN hiding a 40 ms hitch every twelfth frame is exactly the pathology a
+	// progressive builder produces, so the panel needs the tail, not the average.
+	ScopeStats m_frameTimeStats;
 
 	std::string m_status;   // shown in the GUI; errors are not silently swallowed
 	bool m_statusIsError = false;

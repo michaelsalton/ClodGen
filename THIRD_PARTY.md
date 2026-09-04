@@ -70,7 +70,11 @@ current ImPlot), these become upgradable.
 laszip is the one non-permissive dependency. It is built as a **shared** library
 and dynamically linked, which keeps the LGPL-2.1 obligation to supplying the
 library's own source (available at its upstream, and vendored in the submodule).
-It is needed only for `.laz` input. If that obligation ever becomes inconvenient,
+It is needed only for `.laz` input, and every call into it lives in
+[src/io/LazReader.cpp](src/io/LazReader.cpp) — one translation unit, so the licence
+boundary is greppable rather than a matter of trust. Keep it that way; the
+uncompressed `.las` path in `LasReader.cpp` deliberately does not use it.
+If that obligation ever becomes inconvenient,
 [lazperf](https://github.com/hobuinc/laz-perf) (Apache-2.0) is a drop-in
 replacement direction and would also be faster, since it supports per-chunk
 parallel decode.

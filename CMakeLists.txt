@@ -49,10 +49,14 @@ add_executable(clodgen
 	src/cuda/GLInterop.cpp
 	src/shell/App.cpp
 	src/shell/GLRenderer.cpp
+	src/shell/GpuProfiler.cpp
 	src/shell/PipelineRegistry.cpp
 	src/shell/SettingsPanel.cpp
+	src/shell/TimingUi.cpp
 	src/io/PointSource.cpp
 	src/io/RawReader.cpp
+	src/io/LasReader.cpp
+	src/io/LazReader.cpp
 	src/pipelines/FlatPipeline.cpp
 	src/pipelines/CudalodPipeline.cpp
 	src/pipelines/SimlodPipeline.cpp)
