@@ -28,6 +28,14 @@
 
 #include "CudaPrint.cuh"
 
+// ClodGen's accumulator subpass -- NOT upstream. See kernels/simlod/clod_accum.cuh for
+// what it does and plans/03_AccumulatorHook.md sec 2.3 for why it is a separate pass rather
+// than an edit to insertPoints(). The whole footprint in this file is: this include, two
+// file-scope pointers below, two kernel_construct parameters, one call plus grid.sync()
+// in addBatch(), one extra phase in the t_* print, and two counters in the stats pass.
+// No line of upstream algorithm is touched.
+#include "clod_accum.cuh"
+
 namespace cg = cooperative_groups; 
 
 constexpr uint64_t VOXEL_BACKLOG_CAPACITY = 10'000'000;
@@ -43,6 +51,11 @@ Node** backlog_targets     = nullptr;
 uint32_t* numBacklogVoxels = nullptr;
 Chunk** chunkQueue         = nullptr;
 CudaPrint* cudaprint       = nullptr;
+
+// ADDED (ClodGen). Side array indexed by node index, and the read-back globals. Not
+// fields on Node: it is vendored, 152 bytes, static_asserted, and mirrored host-side.
+NodeAccum* nodeAccums       = nullptr;
+AccumGlobals* accumGlobals  = nullptr;
 
 // https://colorbrewer2.org/#type=diverging&scheme=Spectral&n=8 (byte order inverted)
 uint32_t SPECTRAL[8] = {
